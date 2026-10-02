@@ -68,7 +68,14 @@ def cell_volume_and_mask(
     the division on the backward pass.
     """
     cell = cell.view(-1, 3, 3)
-    volume = torch.linalg.det(cell).abs()
+
+    volume = torch.abs(
+        torch.sum(
+            cell[:, 0, :] * torch.cross(cell[:, 1, :], cell[:, 2, :], dim=-1),
+            dim=-1,
+        )
+    )
+    
     periodic = volume > 0.0
     if pbc is not None:
         periodic = torch.logical_and(periodic, pbc.view(-1, 3).any(dim=-1))

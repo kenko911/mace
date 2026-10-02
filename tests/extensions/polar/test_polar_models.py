@@ -111,6 +111,7 @@ pytestmark = [
 ]
 
 from tests.helpers import REPO_ROOT, TESTS_ROOT  # noqa: E402
+
 RUN_TRAIN = REPO_ROOT / "mace" / "cli" / "run_train.py"
 
 # ---------------------------------------------------------------------------
@@ -500,7 +501,9 @@ def _polar_slab_atoms(vacuum: float) -> Atoms:
     symbols = ["O", "H", "H"]
     positions = [[0.0, 0.0, 0.0], [0.8, 0.8, 0.6], [0.8, 0.8, -0.6]]
     cell = [[a, 0.0, 0.0], [0.0, a, 0.0], [0.0, 0.0, vacuum]]
-    return Atoms(symbols=symbols, positions=positions, cell=cell, pbc=(True, True, False))
+    return Atoms(
+        symbols=symbols, positions=positions, cell=cell, pbc=(True, True, False)
+    )
 
 
 def _run_polar_slab(model, dtype, vacuum: float) -> dict:
@@ -850,6 +853,95 @@ def test_polar_calculator_implements_dipole():
     np.testing.assert_allclose(dipole, calc.results["dipole"])
 
 
+def test_polar_calculator_returns_dipole_and_polarizability_derivatives():
+    device = torch.device("cpu")
+    dtype = torch.float64
+    torch.manual_seed(0)
+    model = _build_minimal_model(device, dtype).eval()
+    calc = MACECalculator(
+        models=model,
+        device="cpu",
+        default_dtype="float64",
+        model_type="PolarMACE",
+    )
+
+    dipole_derivatives, polarizability_derivatives = calc.get_dielectric_derivatives(
+        _water_atoms()
+    )
+
+    assert dipole_derivatives.shape == (3, 3, 3)
+    assert polarizability_derivatives.shape == (9, 3, 3)
+    assert np.all(np.isfinite(dipole_derivatives))
+    assert np.all(np.isfinite(polarizability_derivatives))
+
+
+def test_polar_calculator_response_derivatives_match_finite_differences():
+    from ase import units
+
+    device = torch.device("cpu")
+    dtype = torch.float64
+    torch.manual_seed(0)
+    model = _build_minimal_model(device, dtype).eval()
+    calculator = MACECalculator(
+        models=model,
+        device="cpu",
+        default_dtype="float64",
+        model_type="PolarMACE",
+    )
+    atoms = _water_atoms()
+    dipole_derivatives, polarizability_derivatives = (
+        calculator.get_dielectric_derivatives(atoms)
+    )
+
+    displacement = 1e-3
+    plus = atoms.copy()
+    minus = atoms.copy()
+    plus.positions[0, 0] += displacement
+    minus.positions[0, 0] -= displacement
+
+    def dipole_at(geometry, field=None):
+        response_calculator = MACECalculator(
+            models=model,
+            device="cpu",
+            default_dtype="float64",
+            model_type="PolarMACE",
+            external_field=field,
+        )
+        return response_calculator.get_property("dipole", geometry)
+
+    numerical_dipole_derivative = (dipole_at(plus)[0] - dipole_at(minus)[0]) / (
+        2.0 * displacement
+    )
+    np.testing.assert_allclose(
+        dipole_derivatives[0, 0, 0], numerical_dipole_derivative, rtol=2e-4, atol=2e-5
+    )
+
+    field_step = 0.05
+    conversion_to_angstrom3 = 14.3996454784255 * units.Debye**2
+
+    def polarizability_at(geometry):
+        alpha = np.empty((3, 3))
+        for field_axis in range(3):
+            field = np.zeros(3)
+            field[field_axis] = field_step * units.Debye
+            alpha[:, field_axis] = (
+                (dipole_at(geometry, field)[0] - dipole_at(geometry, -field)[0])
+                / (2.0 * field_step)
+                * conversion_to_angstrom3
+            )
+        return alpha
+
+    numerical_polarizability_derivative = (
+        polarizability_at(plus)[0, 0] - polarizability_at(minus)[0, 0]
+    ) / (2.0 * displacement)
+    np.testing.assert_allclose(
+        polarizability_derivatives[0, 0, 0],
+        numerical_polarizability_derivative,
+        rtol=2e-3,
+        atol=2e-4,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Evaluation with charge and spin
 # ---------------------------------------------------------------------------
@@ -895,8 +987,7 @@ def test_water_energy_changes_with_charge_and_spin():
 
     if torch.allclose(E0, E_spin) and torch.allclose(E0, E_charge):
         pytest.skip(
-            "Model weights did not respond to spin/charge changes "
-            "in this environment"
+            "Model weights did not respond to spin/charge changes in this environment"
         )
 
 
@@ -1250,12 +1341,8 @@ def test_polar_stress_matches_fd_large_periodic_boxes(
 # Regression values
 # ---------------------------------------------------------------------------
 
-_REG_REF_PATH = (
-    TESTS_ROOT / "references" / "polar_regression_reference.json"
-)
-_LOCAL_BENCH_ROOT = (
-    TESTS_ROOT / "references" / "x23_lattice_energy"
-)
+_REG_REF_PATH = TESTS_ROOT / "references" / "polar_regression_reference.json"
+_LOCAL_BENCH_ROOT = TESTS_ROOT / "references" / "x23_lattice_energy"
 
 if _REG_REF_PATH.exists():
     _REF = json.loads(_REG_REF_PATH.read_text())

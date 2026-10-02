@@ -17,6 +17,7 @@ os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 import numpy as np
 import torch
+from ase import units
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
 from e3nn import o3
@@ -157,7 +158,9 @@ class MACECalculator(Calculator):
                 "MACE",
                 "PolarMACE",
                 "DipolePolarizabilityMACE",
-            ], "CuEq/OEq only supports MACE, PolarMACE, and DipolePolarizabilityMACE models"
+            ], (
+                "CuEq/OEq only supports MACE, PolarMACE, and DipolePolarizabilityMACE models"
+            )
         if enable_cueq and enable_oeq:
             if not HYBRID_AVAILABLE:
                 raise ImportError(
@@ -758,7 +761,7 @@ class MACECalculator(Calculator):
 
             if getattr(self, "external_field", None) is not None:
                 batch_dict["external_field"] = torch.tensor(
-                    self.external_field,
+                    self.external_field.reshape(1, 3),
                     device=batch_dict["positions"].device,
                     dtype=batch_dict["positions"].dtype,
                 )
@@ -955,13 +958,23 @@ class MACECalculator(Calculator):
             self.results["forces"] += forces_bec
 
     def get_dielectric_derivatives(self, atoms=None):
+        """Return dipole and optional polarizability derivatives by position.
+
+        For PolarMACE, dipole derivatives are in Debye/angstrom and
+        polarizability derivatives are in angstrom^2/angstrom. The latter is
+        derived from the model's field response rather than a forward output.
+        A single model returns arrays; a committee returns one array per model.
+        """
         if atoms is None and self.atoms is None:
             raise ValueError("atoms not set")
         if atoms is None:
             atoms = self.atoms
+        if self.model_type == "PolarMACE":
+            return self._get_polar_mace_dielectric_derivatives(atoms)
         if self.model_type not in ["DipoleMACE", "DipolePolarizabilityMACE"]:
             raise NotImplementedError(
-                "Only implemented for DipoleMACE or DipolePolarizabilityMACE models"
+                "Only implemented for DipoleMACE, DipolePolarizabilityMACE, "
+                "or PolarMACE models"
             )
         batch = self._atoms_to_batch(atoms)
         with torch_tools.default_dtype(self.default_dtype):
@@ -989,6 +1002,82 @@ class MACECalculator(Calculator):
             return dipole_derivatives[0]
         del outputs, batch, atoms
         return dipole_derivatives
+
+    def _get_polar_mace_dielectric_derivatives(self, atoms):
+        """Differentiate PolarMACE's field-dependent dipole by positions.
+
+        The returned arrays follow the dielectric-model convention used above:
+        dipole derivatives are (dipole, atom, xyz), and polarizability
+        derivatives are (flattened dipole/field, atom, xyz). Polarizability is
+        the derivative of the model dipole with respect to its external field;
+        it is not added as a PolarMACE forward output.
+        """
+        if np.any(atoms.pbc):
+            raise ValueError(
+                "PolarMACE response derivatives require non-periodic atoms"
+            )
+
+        batch = self._atoms_to_batch(atoms)
+        dipole_derivatives = []
+        polarizability_derivatives = []
+        # The model field is in eV/D, while the returned polarizability is
+        # conventionally reported in A^3 per V/A.
+        conversion_to_angstrom3 = 14.3996454784255 * units.Debye**3
+
+        with torch_tools.default_dtype(self.default_dtype), torch.enable_grad():
+            for model in self.models:
+                model_batch = self._clone_batch(batch).to_dict()
+                positions = model_batch["positions"]
+                positions.requires_grad_(True)
+                external_field = torch.zeros(
+                    (1, 3),
+                    dtype=positions.dtype,
+                    device=positions.device,
+                    requires_grad=True,
+                )
+                model_batch["external_field"] = external_field
+                output = model(
+                    model_batch,
+                    compute_force=False,
+                    training=self.use_compile,
+                )
+                dipole = output["dipole"][0]
+
+                dmu_dr = []
+                dalpha_dr = []
+                for dipole_axis in range(3):
+                    dipole_position_gradient = torch.autograd.grad(
+                        dipole[dipole_axis],
+                        positions,
+                        retain_graph=True,
+                        create_graph=True,
+                    )[0]
+                    dmu_dr.append(dipole_position_gradient)
+
+                    dipole_field_gradient = torch.autograd.grad(
+                        dipole[dipole_axis],
+                        external_field,
+                        retain_graph=True,
+                        create_graph=True,
+                    )[0][0]
+                    for field_axis in range(3):
+                        mixed_gradient = torch.autograd.grad(
+                            dipole_field_gradient[field_axis],
+                            positions,
+                            retain_graph=True,
+                            create_graph=False,
+                        )[0]
+                        dalpha_dr.append(mixed_gradient)
+
+                dipole_derivatives.append(torch.stack(dmu_dr).detach().cpu().numpy())
+                polarizability_derivatives.append(
+                    torch.stack(dalpha_dr).detach().cpu().numpy()
+                    * conversion_to_angstrom3
+                )
+
+        if self.num_models == 1:
+            return dipole_derivatives[0], polarizability_derivatives[0]
+        return dipole_derivatives, polarizability_derivatives
 
     def get_hessian(self, atoms=None):
         if atoms is None and self.atoms is None:

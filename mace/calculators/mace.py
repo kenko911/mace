@@ -961,8 +961,9 @@ class MACECalculator(Calculator):
         """Return dipole and optional polarizability derivatives by position.
 
         For PolarMACE, dipole derivatives are in Debye/angstrom and
-        polarizability derivatives are in angstrom^2/angstrom. The latter is
-        derived from the model's field response rather than a forward output.
+        polarizability derivatives are in angstrom^2. The latter is derived
+        from the model's field response rather than a forward output. The model
+        dipole itself is in e*angstrom and its external field is in V/angstrom.
         A single model returns arrays; a committee returns one array per model.
         """
         if atoms is None and self.atoms is None:
@@ -1020,9 +1021,10 @@ class MACECalculator(Calculator):
         batch = self._atoms_to_batch(atoms)
         dipole_derivatives = []
         polarizability_derivatives = []
-        # The model field is in eV/D, while the returned polarizability is
-        # conventionally reported in A^3 per V/A.
-        conversion_to_angstrom3 = 14.3996454784255 * units.Debye**3
+        # Convert the native e*angstrom response to Debye/angstrom and A^2.
+        # The field is already in V/angstrom, so only the eV-to-field
+        # conversion is needed for the polarizability derivative.
+        conversion_to_angstrom2 = 14.3996454784255
 
         with torch_tools.default_dtype(self.default_dtype), torch.enable_grad():
             for model in self.models:
@@ -1069,10 +1071,12 @@ class MACECalculator(Calculator):
                         )[0]
                         dalpha_dr.append(mixed_gradient)
 
-                dipole_derivatives.append(torch.stack(dmu_dr).detach().cpu().numpy())
+                dipole_derivatives.append(
+                    torch.stack(dmu_dr).detach().cpu().numpy() / units.Debye
+                )
                 polarizability_derivatives.append(
                     torch.stack(dalpha_dr).detach().cpu().numpy()
-                    * conversion_to_angstrom3
+                    * conversion_to_angstrom2
                 )
 
         if self.num_models == 1:

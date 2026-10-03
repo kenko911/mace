@@ -913,17 +913,20 @@ def test_polar_calculator_response_derivatives_match_finite_differences():
         2.0 * displacement
     )
     np.testing.assert_allclose(
-        dipole_derivatives[0, 0, 0], numerical_dipole_derivative, rtol=2e-4, atol=2e-5
+        dipole_derivatives[0, 0, 0],
+        numerical_dipole_derivative / units.Debye,
+        rtol=2e-4,
+        atol=2e-5,
     )
 
     field_step = 0.05
-    conversion_to_angstrom3 = 14.3996454784255 * units.Debye**2
+    conversion_to_angstrom3 = 14.3996454784255
 
     def polarizability_at(geometry):
         alpha = np.empty((3, 3))
         for field_axis in range(3):
             field = np.zeros(3)
-            field[field_axis] = field_step * units.Debye
+            field[field_axis] = field_step
             alpha[:, field_axis] = (
                 (dipole_at(geometry, field)[0] - dipole_at(geometry, -field)[0])
                 / (2.0 * field_step)
